@@ -2,6 +2,32 @@ import ivy
 from ivy_models.base import BaseModel, BaseSpec
 import math
 from utils import find_pruneable_heads_and_indices, prune_linear_layer
+from modelling_outputs import BaseModelOutput,BaseModelOutputWithPooling
+import sys
+
+
+def convert_head_mask_to_5d(head_mask, num_hidden_layers):
+    if head_mask.ndim() == 1:
+        head_mask = ivy.expand_dims(ivy.expand_dims(ivy.expand_dims(ivy.expand_dims(head_mask,axis=0),axis=0),axis=-1),axis=-1)
+        head_mask = ivy.expand(head_mask,shape=[num_hidden_layers, -1, -1, -1, -1])
+    elif head_mask.ndim() == 2:
+        head_mask = ivy.expand_dims(ivy.expand_dims(ivy.expand_dims(head_mask,axis=1),axis=-1),axis=-1)
+    assert head_mask.ndim() == 5, f"head_mask.dim != 5, instead {head_mask.ndim()}"
+   # head_mask = head_mask.to(dtype=self.dtype)  # switch to float if need + fp16 compatibility
+    return head_mask
+
+
+def get_head_mask(
+    head_mask, num_hidden_layers, is_attention_chunked= False
+):
+    if head_mask is not None:
+        head_mask = convert_head_mask_to_5d(head_mask, num_hidden_layers)
+        if is_attention_chunked is True:
+            head_mask = ivy.expand_dims(head_mask,axis=-1)
+    else:
+        head_mask = [None] * num_hidden_layers
+
+    return head_mask
 
 
 class ASTConfig(BaseSpec):
@@ -23,6 +49,7 @@ class ASTConfig(BaseSpec):
         max_length=1024,
         num_mel_bins=128,
         device=None,
+        **kwargs,
     ):
         device = ivy.default(device, ivy.default_device())
         super(ASTConfig, self).__init__(
@@ -42,10 +69,14 @@ class ASTConfig(BaseSpec):
             max_length=max_length,
             num_mel_bins=num_mel_bins,
             device=device,
+            **kwargs,
         )
 
 
 class ASTEmbeddings(ivy.Module):
+    """
+    Construct the CLS token, position and patch embeddings.
+    """
     def __init__(
         self,
         config: ASTConfig,
@@ -115,6 +146,7 @@ class ASTPatchEmbeddings(ivy.Module):
             data_format="NCHW",
         )
 
+
     def _forward(self, input_values):
         input_values = ivy.expand_dims(input_values, axis=1)
         input_values = input_values.permute_dims(axes=(0,1,3,2))
@@ -131,6 +163,7 @@ class ASTSelfAttention(ivy.Module):
                 f"The hidden size {config.hidden_size,} is not a multiple of the number of attention "
                 f"heads {config.num_attention_heads}."
             )
+        self.config = config
         self.hidden_size = config.hidden_size
         self.qkv_bias = config.qkv_bias
         self.num_attention_heads = config.num_attention_heads
@@ -148,10 +181,10 @@ class ASTSelfAttention(ivy.Module):
         self.value = ivy.Linear(
             self.hidden_size, self.all_head_size, with_bias=self.qkv_bias
         )
-        self.dropout = ivy.Dropout(config.attention_probs_dropout_prob)
+        self.dropout = ivy.Dropout(self.config.attention_probs_dropout_prob)
 
     def transpose_for_scores(self, x):
-        new_x_shape = x.shape()[:-1] + (
+        new_x_shape = x.shape[:-1] + (
             self.num_attention_heads,
             self.attention_head_size,
         )
@@ -164,7 +197,8 @@ class ASTSelfAttention(ivy.Module):
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
         query_layer = self.transpose_for_scores(mixed_query_layer)
-        attention_scores = ivy.matmul(query_layer, key_layer.transpose(-1, -2))
+    
+        attention_scores = ivy.matmul(query_layer, ivy.permute_dims(key_layer,(0,1,3,2)))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         attention_probs = ivy.softmax(attention_scores, axis=-1)
         attention_probs = self.dropout(attention_probs)
@@ -174,7 +208,7 @@ class ASTSelfAttention(ivy.Module):
         context_layer = ivy.permute_dims(
             context_layer, (0, 2, 1, 3)
         )  ##todo contiguous array
-        new_context_layer_shape = context_layer.shape()[:-2] + (self.all_head_size,)
+        new_context_layer_shape = context_layer.shape[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
         outputs = (
             (context_layer, attention_probs) if output_attentions else (context_layer,)
@@ -211,7 +245,7 @@ class ASTAttention(ivy.Module):
         super(ASTAttention, self).__init__(v=v)
 
     def _build(self, *args, **kwargs):
-        self.attention = ASTAttention(self.config)
+        self.attention = ASTSelfAttention(self.config)
         self.output = ASTSelfOutput(self.config)
         self.pruned_heads = set()
 
@@ -254,7 +288,7 @@ class ASTIntermediate(ivy.Module):
     def _build(self, *args, **kwargs):
         self.dense = ivy.Linear(self.config.hidden_size,self.config.intermediate_size)
         if isinstance(self.config.hidden_act,str):
-            self.intermediate_act_fn = ivy.Gelu() ##todo adding multiple functions
+            self.intermediate_act_fn = ivy.GELU() ##todo adding multiple functions
         else:
             self.intermediate_act_fn = config.hidden_act
     
@@ -272,7 +306,7 @@ class ASTOutput(ivy.Module):
         super(ASTOutput,self).__init__(v=v)
     
     def _build(self,*args,**kwargs):
-        self.dense = ivy.Linear(self.config.hidden_states)
+        self.dense = ivy.Linear(self.config.intermediate_size, self.config.hidden_size)
         self.dropout = ivy.Dropout(self.config.hidden_dropout_prob)
     
     def _forward(self,hidden_states,input_tensor):
@@ -293,10 +327,14 @@ class ASTLayer(ivy.Module):
         self.seq_len_dim = 1
         super(ASTLayer,self).__init__(v=v)
     
+
     def _build(self,*args,**kwargs):
+        
         self.attention = ASTAttention(self.config)
         self.intermediate = ASTIntermediate(self.config)
         self.output = ASTOutput(self.config)
+
+
         self.layernorm_before = ivy.LayerNorm(self.config.hidden_size,eps=self.config.layer_norm_eps)
         self.layernorm_after = ivy.LayerNorm(self.config.hidden_size,eps=self.config.layer_norm_eps)
 
@@ -320,11 +358,10 @@ class ASTEncoder(ivy.Module):
                 v: ivy.Container = None,
 ):
         self.config = config
-        self.gradient_checkpointing = False
-        super(ASTEncoder,self).__init(v=v)
+        super(ASTEncoder,self).__init__(v=v)
     
     def _build(self,*args,**kwargs):
-        self.layer =  [ASTLayer(config) for _ in range(config.num_hidden_layers)] ##TODO torch modulelist
+        self.layer =  [ASTLayer(self.config) for _ in range(self.config.num_hidden_layers)] ##TODO torch modulelist
     
     def _forward(self,hidden_states,head_mask=None,output_attentions=False,output_hidden_states=False,return_dict=False):
         all_hidden_states = () if output_hidden_states else None
@@ -341,16 +378,88 @@ class ASTEncoder(ivy.Module):
             if output_attentions:
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
         if output_hidden_states:
-            all_self_attentions = all_self_attentions + (hidden_states,)
-        
+            all_hidden_states = all_hidden_states + (hidden_states,)
+                    
         if not return_dict:
             return tuple(v for v in [hidden_states,all_hidden_states,all_self_attentions] if v is not None)
 
+        return BaseModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
 
-config = ASTConfig()
-testing = ASTSelfAttention(config)
-import numpy as np
+##TODO ASTPretrained model implement
 
-loaded_myarray = np.loadtxt("/workspaces/models/ivy_models/ast/myarray.txt")
-backtomyarray = loaded_myarray.reshape(1, 1024, 128)
-print(testing(ivy.array(backtomyarray)))
+class ASTModel(BaseModel):
+    def __init__(self,
+                config: ASTConfig,
+                v: ivy.Container = None,
+):
+        self.config = config
+        super(ASTModel, self).__init__(v=v)
+
+    @classmethod
+    def get_spec_class(self):
+        return ASTConfig
+        
+    def _build(self,*args,**kwargs):
+        self.embeddings = ASTEmbeddings(self.config)
+        self.encoder = ASTEncoder(self.config)
+        self.layernorm = ivy.LayerNorm(self.config.hidden_size,eps=self.config.layer_norm_eps)
+   
+    def get_input_embeddings(self) -> ASTPatchEmbeddings:
+        return self.embeddings.patch_embeddings
+
+    def _prune_heads(self, heads_to_prune):
+        for layer, heads in heads_to_prune.items():
+            self.encoder.layer[layer].attention.prune_heads(heads)
+
+    def _forward(self,input_values=None,head_mask=None,output_attentions=None,output_hidden_states=None,return_dict=None):
+        ##TODO conifg.output_attentions
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_values is None:
+            raise ValueError("You have to specify input_values") ##TODO ivy error block
+        head_mask = get_head_mask(head_mask, self.config.num_hidden_layers) ##TODO implement headmask for this 
+        embedding_output = self.embeddings(input_values)
+        encoder_outputs = self.encoder(
+            embedding_output,
+            head_mask=head_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        sequence_output = encoder_outputs[0]
+        sequence_output = self.layernorm(sequence_output)
+
+        pooled_output = (sequence_output[:, 0] + sequence_output[:, 1]) / 2
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+        
+        return BaseModelOutputWithPooling(
+            last_hidden_state=sequence_output,
+            pooler_output=pooled_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+        )
+
+class ASTMLPHead(ivy.Module):
+    def __init__(self,config: ASTConfig,
+                v: ivy.Container = None,
+):
+        super(ASTMLPHead,self).__init__(v=v,config=config)
+    
+    def _build(self,*args,**kwargs):
+        self.layernorm =ivy.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dense = ivy.Linear(config.hidden_size, config.num_labels) if config.num_labels > 0 else ivy.Identity()
+
+    @classmethod
+    def get_spec_class(self):
+        return ASTConfig
+
